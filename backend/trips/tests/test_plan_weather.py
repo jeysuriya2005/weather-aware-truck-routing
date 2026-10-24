@@ -80,6 +80,10 @@ def test_checkpoint_eta_and_forecast_hour_alignment():
         assert timedelta(0) <= hour - eta < timedelta(hours=1)
         assert hour.minute == 0 and hour.utcoffset() == timedelta(0)
         assert cp["status"] == "ok"
+        # Provenance: the forecast point is the 0.05-deg grid point nearest the checkpoint.
+        point = cp["forecast_point"]
+        assert abs(point["lat"] - cp["lat"]) <= 0.025 + 1e-6 and abs(point["lon"] - cp["lon"]) <= 0.025 + 1e-6
+        assert abs(point["lat"] / 0.05 - round(point["lat"] / 0.05)) < 1e-6
 
 
 # --- risk, summaries, recommendation --------------------------------------------------
@@ -223,3 +227,72 @@ def test_open_meteo_requests_are_bounded_and_reused():
     assert 1 <= first_calls <= 6
     plan(interval=10)  # identical trip: served from cache
     assert len(open_meteo_calls()) == first_calls
+
+
+# --- Location budget (regression: long 10-mi trips exceeded Open-Meteo's 600/min) ---
+
+def _requested_locations():
+    from urllib.parse import parse_qs, urlparse
+
+    return sum(len(parse_qs(urlparse(c.request.url).query)["latitude"][0].split(",")) for c in open_meteo_calls())
+
+
+@responses.activate
+def test_normal_plan_uses_fine_grid_within_budget():
+    add_routes()
+    mock_open_meteo()
+    data = plan(interval=25)
+    assert data["weather_risk"]["forecast_grid_degrees"] == 0.05
+    assert _requested_locations() == data["weather_risk"]["forecast_locations"] <= 500
+
+
+@responses.activate
+def test_plan_needing_too_many_points_coarsens_lookup_grid_but_keeps_every_checkpoint(monkeypatch):
+    # Shrink the budget so the 3 fixture routes at 10 mi (~270 checkpoints) exceed it.
+    monkeypatch.setattr("trips.services.LOCATION_BUDGET", 160)
+    monkeypatch.setattr("trips.weather.LOCATION_BUDGET", 160)
+    add_routes()
+    mock_open_meteo()
+    data = plan(interval=10)
+    weather = data["weather_risk"]
+    step = weather["forecast_grid_degrees"]
+    assert step > 0.05
+    assert weather["status"] == "complete"
+    assert "grid" in weather["message"] and "request limits" in weather["message"]
+    assert _requested_locations() <= 160  # hard cap: checkpoints + heatmap never exceed the budget
+    for route in data["routes"]:
+        gaps = [b["mile"] - a["mile"] for a, b in zip(route["checkpoints"], route["checkpoints"][1:])]
+        assert all(g <= 10 + 1e-6 for g in gaps)  # still a checkpoint every 10 mi
+        for cp in route["checkpoints"]:
+            assert cp["status"] == "ok"
+            point = cp["forecast_point"]
+            assert abs(point["lat"] / step - round(point["lat"] / step)) < 1e-6
+            assert abs(point["lat"] - cp["lat"]) <= step / 2 + 1e-6
+
+
+@responses.activate
+def test_rate_limited_batch_gives_partial_forecasts_not_zero():
+    from urllib.parse import parse_qs, urlparse
+
+    from .open_meteo_fixtures import make_callback
+
+    calls = {"n": 0}
+
+    def second_request_rate_limited(request):
+        calls["n"] += 1
+        lats = parse_qs(urlparse(request.url).query)["latitude"][0].split(",")
+        if len(lats) == 100 and float(lats[0]) > 36:  # one of the full batches
+            return 429, {"Content-Type": "application/json"}, '{"error": true, "reason": "Minutely API request limit exceeded."}'
+        return make_callback()(request)
+
+    add_routes()
+    responses.add_callback(responses.GET, URL_PATTERN, callback=second_request_rate_limited)
+    data = plan(interval=10)
+    status = data["weather_risk"]
+    # Before the fix one 429 discarded every forecast (0/N, "unavailable").
+    assert status["status"] == "partial"
+    assert 0 < status["checkpoints_with_forecast"] < status["checkpoints_total"]
+    assert data["recommendation"]["status"] != "unavailable"
+    assert data["recommendation"]["coverage_complete"] is False
+    unknown = [cp for r in data["routes"] for cp in r["checkpoints"] if cp["status"] == "unavailable"]
+    assert unknown and all(cp["risk"] is None for cp in unknown)

@@ -25,7 +25,18 @@ from .domain.geometry import Coordinate
 from .domain.recommendation import RiskSegment, RouteRiskInput, recommend_route
 from .domain.routes import RouteOption
 from .providers.tomtom import MAX_ALTERNATIVES, TomTomClient
-from .weather import HEATMAP_HOURS, ForecastResult, fetch_forecasts, forecast_window, snap
+from .weather import (
+    CHECKPOINT_SNAP_DEGREES,
+    HEATMAP_HOURS,
+    LOCATION_BUDGET,
+    MIN_HEATMAP_POINTS,
+    ForecastResult,
+    choose_snap_step,
+    fetch_forecasts,
+    forecast_window,
+    heatmap_point_budget,
+    snap,
+)
 
 REQUESTED_ROUTE_OPTIONS = MAX_ALTERNATIVES + 1
 WEATHER_PROVIDER = "Open-Meteo"
@@ -81,11 +92,15 @@ def plan_trip(
         timeline = build_timeline(route)
         placed.append((route, timeline.eta_source, place_checkpoints(route, interval_miles, timeline)))
 
-    # 2. One batched, cached forecast lookup for checkpoints + heatmap corridor.
+    # 2. One batched, cached forecast lookup for checkpoints + heatmap corridor,
+    #    kept within the provider's per-minute location budget (checkpoints first).
     latest_eta = max(cp.eta for _, _, cps in placed for cp in cps)
     window = forecast_window(departure_time, latest_eta, now)
-    grid = corridor_grid([route.points for route in routes])
-    locations = [snap(cp.coordinate) for _, _, cps in placed for cp in cps] + grid.points
+    all_checkpoints = [cp for _, _, cps in placed for cp in cps]
+    snap_step = choose_snap_step((cp.coordinate for cp in all_checkpoints), LOCATION_BUDGET - MIN_HEATMAP_POINTS)
+    checkpoint_points = list(dict.fromkeys(snap(cp.coordinate, snap_step) for cp in all_checkpoints))
+    grid = corridor_grid([route.points for route in routes], max_points=heatmap_point_budget(len(checkpoint_points)))
+    locations = list(dict.fromkeys(checkpoint_points + grid.points))
     forecasts = fetch_forecasts(locations, window)
 
     # 3. Risk per checkpoint at its arrival hour.
@@ -93,7 +108,7 @@ def plan_trip(
     for route, eta_source, checkpoints in placed:
         times = [forecast_hour_for(cp.eta) for cp in checkpoints]
         assessed = [
-            assess_sample(forecasts.sample(snap(cp.coordinate), hour), load_weight_lb)
+            assess_sample(forecasts.sample(snap(cp.coordinate, snap_step), hour), load_weight_lb)
             for cp, hour in zip(checkpoints, times)
         ]
         analyses.append(_RouteAnalysis(route, eta_source, checkpoints, assessed, times))
@@ -104,12 +119,12 @@ def plan_trip(
     ranks = {route_id: i + 1 for i, route_id in enumerate(recommendation.ranked_route_ids)} if recommendation else {}
     labels = {a.route.route_id: presenters.route_label(i) for i, a in enumerate(analyses)}
 
-    weather_status = _weather_status(analyses, forecasts, window)
+    weather_status = _weather_status(analyses, forecasts, window, snap_step, len(locations))
     presented_routes = []
     for index, analysis in enumerate(analyses):
         route_id = analysis.route.route_id
         checkpoints = [
-            presenters.present_checkpoint(cp, hour, assessed, load_weight_lb)
+            presenters.present_checkpoint(cp, hour, assessed, load_weight_lb, snap(cp.coordinate, snap_step))
             for cp, hour, assessed in zip(analysis.checkpoints, analysis.forecast_times, analysis.assessed)
         ]
         presented_routes.append(
@@ -143,11 +158,18 @@ def plan_trip(
     }
 
 
-def _weather_status(analyses: list[_RouteAnalysis], forecasts: ForecastResult, window) -> dict:
+def _weather_status(
+    analyses: list[_RouteAnalysis], forecasts: ForecastResult, window, snap_step: float, location_count: int
+) -> dict:
     total = sum(len(a.assessed) for a in analyses)
     known = sum(a.known_checkpoints for a in analyses)
     if known == total:
         status, message = "complete", "Forecasts are available for every checkpoint."
+        if snap_step > CHECKPOINT_SNAP_DEGREES:
+            message += (
+                f" This long trip reads forecasts from a {snap_step:g}° grid (about "
+                f"{snap_step * 111:.0f} km) to stay within the weather provider's request limits."
+            )
     elif known == 0:
         status = "unavailable"
         if forecasts.error is not None:
@@ -165,6 +187,9 @@ def _weather_status(analyses: list[_RouteAnalysis], forecasts: ForecastResult, w
         "message": message,
         "provider": WEATHER_PROVIDER,
         "checkpoints_total": total,
+        # Grid (degrees) checkpoint forecasts are read from: 0.05 normally, coarser for very long trips.
+        "forecast_grid_degrees": snap_step,
+        "forecast_locations": location_count,
         "checkpoints_with_forecast": known,
         "window_start": window.start.isoformat() if window else None,
         "window_end": window.end.isoformat() if window else None,

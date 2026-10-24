@@ -40,7 +40,7 @@ def assessed(wind=5.0, rain=0.0, snow=0.0, load=20_000, gust=10.0):
         ([route("a", 2, (100, M)), route("b", 3, (100, L))],
          "Route B ties on Severe and High miles and has the lowest average risk (0.00 vs 1.00 on Route A"),
         ([route("a", 3, (100, L)), route("b", 2.5, (100, L))],
-         "Route B ties on all weather-risk criteria and is the fastest (2 h 30 min vs 3 h 00 min on Route A)."),
+         "Route B ties on all weather-risk criteria and is the fastest (2 h 30 min vs 3 h on Route A)."),
         ([route("a", 2, (100, L)), route("b", 2, (100, L))],
          "Route A ties with Route B on every criterion; the routing provider listed it first."),
         ([route("a", 2, (100, L))], "Route A is the only route option returned."),
@@ -49,6 +49,16 @@ def assessed(wind=5.0, rain=0.0, snow=0.0, load=20_000, gust=10.0):
 def test_explanations_name_the_deciding_criterion(routes, fragment):
     text = presenters.explain_recommendation(recommend_route(routes), LABELS)
     assert fragment in text
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0, "0 min"), (29, "0 min"), (30, "1 min"), (3599, "1 h"), (3600, "1 h"), (3900, "1 h 5 min"),
+     (42_540, "11 h 49 min"), (51_060, "14 h 11 min")],
+)
+def test_duration_text_matches_frontend_format(seconds, expected):
+    # Mirrors frontend/src/lib/units.test.ts formatDuration cases (regression: "3 h 00 min" vs "3 h").
+    assert presenters._hours(seconds) == expected
 
 
 def test_no_safe_route_is_stated_explicitly():

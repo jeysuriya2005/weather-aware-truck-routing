@@ -5,12 +5,13 @@ Contains no business rules: it only presents domain results.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from datetime import datetime
 
 from .domain.checkpoints import Checkpoint
 from .domain.forecast import AssessedSample
-from .domain.geometry import simplify_polyline
+from .domain.geometry import Coordinate, simplify_polyline
 from .domain.recommendation import Recommendation, RouteRiskSummary
 from .domain.risk import RiskLevel
 from .domain.routes import Place, RouteOption
@@ -99,7 +100,11 @@ def checkpoint_warnings(assessed: AssessedSample, load_weight_lb: float) -> list
 
 
 def present_checkpoint(
-    checkpoint: Checkpoint, forecast_time: datetime, assessed: AssessedSample, load_weight_lb: float
+    checkpoint: Checkpoint,
+    forecast_time: datetime,
+    assessed: AssessedSample,
+    load_weight_lb: float,
+    forecast_point: Coordinate | None = None,
 ) -> dict:
     sample, risk = assessed.sample, assessed.risk
     return {
@@ -112,6 +117,8 @@ def present_checkpoint(
         "lon": round(checkpoint.coordinate.lon, 5),
         "eta": _iso(checkpoint.eta),
         "forecast_time": _iso(forecast_time),
+        # The grid point whose forecast was used (checkpoints are snapped to 0.05 deg).
+        "forecast_point": None if forecast_point is None else {"lat": forecast_point.lat, "lon": forecast_point.lon},
         "status": "ok" if assessed.available else "unavailable",
         "weather": None
         if not assessed.available
@@ -222,8 +229,13 @@ def present_route(
 # --- recommendation ------------------------------------------------------------
 
 def _hours(seconds: float) -> str:
-    minutes = round(seconds / 60)
-    return f"{minutes // 60} h {minutes % 60:02d} min"
+    """Same format as the frontend's formatDuration(), so a duration reads identically everywhere."""
+    # Half-up like JavaScript's Math.round (Python's round() is half-to-even: round(0.5) == 0).
+    minutes = math.floor(seconds / 60 + 0.5)
+    hours, rest = divmod(minutes, 60)
+    if hours == 0:
+        return f"{rest} min"
+    return f"{hours} h" if rest == 0 else f"{hours} h {rest} min"
 
 
 def explain_recommendation(recommendation: Recommendation, labels: dict[str, str]) -> str:

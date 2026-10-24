@@ -5,6 +5,8 @@ Grid cells are aligned to a fixed lattice (multiples of the spacing in
 degrees), so the same area always produces the same sample coordinates,
 which keeps forecasts cacheable. The finest spacing that keeps the number
 of cells within `max_points` is chosen, which bounds the forecast cost.
+`max_points` is a hard cap: the weather provider counts every location
+against a per-minute limit, so exceeding it fails the request.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from dataclasses import dataclass
 
 from .geometry import Coordinate, cumulative_distances_meters, haversine_meters, interpolate
 
-SPACING_OPTIONS_DEGREES = (0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0)
+SPACING_OPTIONS_DEGREES = (0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0)
 DEFAULT_MAX_POINTS = 200
 DEFAULT_HALF_WIDTH_KM = 30.0
 KM_PER_DEGREE_LAT = 111.32
@@ -78,9 +80,6 @@ def corridor_grid(
     step_m = min(SPACING_OPTIONS_DEGREES[0] * KM_PER_DEGREE_LAT * 1000 / 2, half_width_km * 1000)
     samples = [point for route in routes for point in resample(route, step_m)]
 
-    # If even the coarsest spacing exceeds max_points (only for extreme,
-    # continent-spanning corridors), the coarsest grid is used whole: dropping
-    # cells would silently remove part of the corridor.
     cells: set[tuple[int, int]] = set()
     spacing = SPACING_OPTIONS_DEGREES[-1]
     for option in SPACING_OPTIONS_DEGREES:
@@ -90,5 +89,11 @@ def corridor_grid(
             break
 
     ordered = sorted(cells)
+    if len(ordered) > max_points:
+        # Even the coarsest spacing is too many cells (very wide, multi-route,
+        # continent-scale corridors). Thin evenly so coverage stays spread over
+        # the whole corridor while the provider's location limit is respected.
+        stride = len(ordered) / max_points
+        ordered = [ordered[int(i * stride)] for i in range(max_points)]
     points = [Coordinate(round(r * spacing, 6), round(c * spacing, 6)) for r, c in ordered]
     return CorridorGrid(spacing_degrees=spacing, points=points)

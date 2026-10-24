@@ -69,7 +69,7 @@ describe('heatmap helpers', () => {
       '#4c0519',
       UNKNOWN_COLOR,
     ])
-    expect(heatmapOpacityExpression(3)).toEqual(['case', ['==', ['get', 'r3'], -1], 0.25, 0.5])
+    expect(heatmapOpacityExpression(3)).toEqual(['case', ['==', ['get', 'r3'], -1], 0.2, 0.36])
   })
 
   it('scales cell radius with zoom', () => {

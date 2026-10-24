@@ -42,9 +42,14 @@ export function heatmapColorExpression(frame: number): ExpressionSpecification {
   return riskColorMatch(['get', frameProperty(frame)], 'score')
 }
 
-/** Unknown cells stay visible but faint, so gaps read as "no data", not "clear". */
+/**
+ * Unknown cells stay visible but faint, so gaps read as "no data", not "clear".
+ * Kept below the route lines' opacity so routes and checkpoints stay legible on top.
+ */
+export const HEATMAP_OPACITY = { known: 0.36, unknown: 0.2 }
+
 export function heatmapOpacityExpression(frame: number): ExpressionSpecification {
-  return ['case', ['==', ['get', frameProperty(frame)], UNKNOWN_SCORE], 0.25, 0.5]
+  return ['case', ['==', ['get', frameProperty(frame)], UNKNOWN_SCORE], HEATMAP_OPACITY.unknown, HEATMAP_OPACITY.known]
 }
 
 const EARTH_METERS_PER_PIXEL_Z0 = 78_271.517 // MapLibre 512 px tiles at the equator
@@ -62,6 +67,58 @@ export function heatmapRadiusExpression(spacingDegrees: number, latitude: number
 export function meanLatitude(heatmap: Heatmap): number {
   if (heatmap.lats.length === 0) return 0
   return heatmap.lats.reduce((sum, lat) => sum + lat, 0) / heatmap.lats.length
+}
+
+export interface FrameLabel {
+  offsetHours: number
+  /** Departure + offset: the moment the slider refers to. */
+  moment: string
+  /** Forecast record used: the UTC hour whose preceding-hour period contains `moment`. */
+  forecastHour: string | undefined
+}
+
+/**
+ * Keeps "departure + N h" and the forecast hour apart: a 13:20 departure at
+ * +0 h uses the 14:00 forecast record, so labelling +0 h as 14:00 would be wrong.
+ */
+export function frameLabel(heatmap: Heatmap, departureIso: string, frame: number): FrameLabel {
+  const offsetHours = heatmap.frame_offsets_hours[frame] ?? frame
+  const moment = new Date(new Date(departureIso).getTime() + offsetHours * 3_600_000).toISOString()
+  return { offsetHours, moment, forecastHour: heatmap.frame_times[frame] }
+}
+
+/**
+ * The overlay frame that uses the same forecast hour as a checkpoint's ETA
+ * (frame h = hour containing departure + h; checkpoint = hour containing its ETA),
+ * or null if the ETA is beyond the 0-48 h overlay.
+ */
+export function frameForForecastHour(heatmap: Heatmap, forecastTimeIso: string): number | null {
+  const target = Date.parse(forecastTimeIso)
+  const index = heatmap.frame_times.findIndex((time) => Date.parse(time) === target)
+  return index === -1 ? null : index
+}
+
+export interface CellForecast {
+  index: number
+  lat: number
+  lon: number
+  risk: number | null
+  windMph: number | null
+  rainInPerHr: number | null
+  snowInPerHr: number | null
+}
+
+/** The forecast values the overlay shows for one corridor cell at one frame. */
+export function cellForecast(heatmap: Heatmap, index: number, frame: number): CellForecast {
+  return {
+    index,
+    lat: heatmap.lats[index],
+    lon: heatmap.lons[index],
+    risk: heatmap.risk[frame]?.[index] ?? null,
+    windMph: heatmap.wind_mph[frame]?.[index] ?? null,
+    rainInPerHr: heatmap.rain_in_per_hr[frame]?.[index] ?? null,
+    snowInPerHr: heatmap.snow_in_per_hr[frame]?.[index] ?? null,
+  }
 }
 
 /** Share of points with a forecast in a frame, for status text. */

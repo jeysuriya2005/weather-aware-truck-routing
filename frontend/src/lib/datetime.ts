@@ -26,6 +26,32 @@ export function defaultDeparture(now: Date = new Date()): Date {
   return date
 }
 
+// Mirrors backend/trips/serializers.py: 15 min in the past to 13 days ahead.
+export const DEPARTURE_PAST_TOLERANCE_MS = 15 * 60_000
+export const DEPARTURE_MAX_AHEAD_MS = 13 * 24 * 3_600_000
+
+/** Allowed departure range as datetime-local strings (min rounded up to the minute). */
+export function departureBounds(now: Date = new Date()): { min: string; max: string } {
+  const min = new Date(now.getTime() - DEPARTURE_PAST_TOLERANCE_MS + 60_000)
+  const max = new Date(now.getTime() + DEPARTURE_MAX_AHEAD_MS)
+  return { min: toLocalInputValue(min), max: toLocalInputValue(max) }
+}
+
+/** Client-side check before the request; the server re-validates. */
+export function departureProblem(iso: string, now: Date = new Date()): string | null {
+  const t = new Date(iso).getTime()
+  if (t < now.getTime() - DEPARTURE_PAST_TOLERANCE_MS) return 'Departure cannot be in the past.'
+  if (t > now.getTime() + DEPARTURE_MAX_AHEAD_MS) {
+    return 'Departure must be within 13 days so forecasts cover the trip and the 48-hour outlook.'
+  }
+  return null
+}
+
+/** Short local time, e.g. "Sat 4:00 PM". */
+export function formatShortTime(iso: string): string {
+  return new Date(iso).toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' })
+}
+
 /** Formats an API timestamp in the viewer's local time with a zone name. */
 export function formatDateTime(iso: string): string {
   return new Date(iso).toLocaleString('en-US', {

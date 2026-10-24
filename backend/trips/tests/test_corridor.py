@@ -76,3 +76,19 @@ def test_rejects_bad_input():
         corridor_grid([])
     with pytest.raises(ValueError):
         corridor_grid([DALLAS_DENVER], max_points=0)
+
+
+@pytest.mark.parametrize("budget", [60, 100, 135])
+def test_max_points_is_a_hard_cap_for_continental_corridors(budget):
+    # Regression: three diverging coast-to-coast routes produced 214 cells at the
+    # coarsest spacing although only 135 were budgeted, pushing a plan past the
+    # weather provider's per-minute location limit.
+    routes = [
+        line((45.52, -122.68), (40.71, -74.0), steps=4000),
+        line((45.52, -122.68), (39.0, -95.0), steps=2000) + line((39.0, -95.0), (40.71, -74.0), steps=2000)[1:],
+        line((45.52, -122.68), (34.0, -105.0), steps=2000) + line((34.0, -105.0), (40.71, -74.0), steps=2000)[1:],
+    ]
+    grid = corridor_grid(routes, max_points=budget)
+    assert len(grid.points) <= budget
+    lons = [p.lon for p in grid.points]
+    assert min(lons) < -115 and max(lons) > -80  # thinning keeps both coasts covered

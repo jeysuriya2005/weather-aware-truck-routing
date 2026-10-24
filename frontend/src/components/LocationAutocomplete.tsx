@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
 import { ApiError, geocode } from '../api/client'
 import type { Place } from '../api/types'
+import { Icon, type IconName } from './Icon'
 
 const MIN_QUERY_LENGTH = 2
 const DEBOUNCE_MS = 300
@@ -11,6 +12,7 @@ interface Props {
   value: Place | null
   onChange: (place: Place | null) => void
   disabled?: boolean
+  icon?: IconName
 }
 
 type SearchState =
@@ -19,7 +21,7 @@ type SearchState =
   | { status: 'done'; results: Place[] }
   | { status: 'error'; message: string }
 
-export function LocationAutocomplete({ label, placeholder, value, onChange, disabled }: Props) {
+export function LocationAutocomplete({ label, placeholder, value, onChange, disabled, icon = 'search' }: Props) {
   const inputId = useId()
   const listId = `${inputId}-list`
   const [text, setText] = useState(value?.label ?? '')
@@ -88,30 +90,33 @@ export function LocationAutocomplete({ label, placeholder, value, onChange, disa
   return (
     <div className="field autocomplete">
       <label htmlFor={inputId}>{label}</label>
-      <input
-        id={inputId}
-        type="text"
-        role="combobox"
-        aria-expanded={showList}
-        aria-controls={listId}
-        aria-autocomplete="list"
-        aria-activedescendant={showList && activeIndex >= 0 ? `${listId}-${activeIndex}` : undefined}
-        autoComplete="off"
-        placeholder={placeholder}
-        value={text}
-        disabled={disabled}
-        onChange={(event) => {
-          setText(event.target.value)
-          setOpen(true)
-          if (value) onChange(null) // edited text no longer matches the selection
-        }}
-        onFocus={() => setOpen(true)}
-        // Delay so a click on a suggestion registers before the list closes.
-        onBlur={() => {
-          blurTimer.current = window.setTimeout(() => setOpen(false), 150)
-        }}
-        onKeyDown={handleKeyDown}
-      />
+      <div className="input-with-icon">
+        <Icon name={icon} className="input-with-icon__icon" />
+        <input
+          id={inputId}
+          type="text"
+          role="combobox"
+          aria-expanded={showList}
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-activedescendant={showList && activeIndex >= 0 ? `${listId}-${activeIndex}` : undefined}
+          autoComplete="off"
+          placeholder={placeholder}
+          value={text}
+          disabled={disabled}
+          onChange={(event) => {
+            setText(event.target.value)
+            setOpen(true)
+            if (value) onChange(null) // edited text no longer matches the selection
+          }}
+          onFocus={() => setOpen(true)}
+          // Delay so a click on a suggestion registers before the list closes.
+          onBlur={() => {
+            blurTimer.current = window.setTimeout(() => setOpen(false), 150)
+          }}
+          onKeyDown={handleKeyDown}
+        />
+      </div>
       {showList && (
         <ul id={listId} role="listbox" className="autocomplete-list">
           {visible.status === 'loading' && <li className="autocomplete-note">Searching…</li>}

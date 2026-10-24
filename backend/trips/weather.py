@@ -28,6 +28,32 @@ CACHE_TTL_SECONDS = 30 * 60  # models update hourly; keep reuse short
 CACHE_PREFIX = "openmeteo:v1"
 CHECKPOINT_SNAP_DEGREES = 0.05  # ~5.5 km; nearby checkpoints share one forecast lookup
 
+# Open-Meteo counts EVERY location in a request against its free-tier limit of
+# 600 calls/minute (observed: 100-location bursts -> HTTP 429, 2026-10-24). A
+# coast-to-coast plan at 10 mi needs ~1,090 locations, so each plan is capped
+# well below the limit. Checkpoints get priority; the heatmap gets the rest.
+LOCATION_BUDGET = 500
+MIN_HEATMAP_POINTS = 60
+MAX_HEATMAP_POINTS = 200
+# Coarser forecast-lookup grids, used only when a trip's checkpoints need more
+# distinct forecast points than the budget allows. Checkpoint placement and
+# ETAs are unaffected; only the weather grid point each one reads from changes.
+SNAP_OPTIONS_DEGREES = (0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0)
+
+
+def choose_snap_step(coordinates: Iterable[Coordinate], max_points: int) -> float:
+    """Finest lookup grid whose distinct points fit in `max_points`."""
+    coordinates = list(coordinates)
+    for step in SNAP_OPTIONS_DEGREES:
+        if len({snap(c, step) for c in coordinates}) <= max_points:
+            return step
+    return SNAP_OPTIONS_DEGREES[-1]
+
+
+def heatmap_point_budget(checkpoint_points: int) -> int:
+    """Heatmap points left after checkpoints, within [MIN, MAX]."""
+    return max(MIN_HEATMAP_POINTS, min(MAX_HEATMAP_POINTS, LOCATION_BUDGET - checkpoint_points))
+
 
 @dataclass(frozen=True)
 class ForecastWindow:
@@ -91,12 +117,15 @@ def fetch_forecasts(
     if not missing:
         return result
     try:
-        fetched = (client or OpenMeteoClient()).fetch_hourly(missing, window.start, window.end)
+        fetched, result.error = (client or OpenMeteoClient()).fetch_hourly_partial(missing, window.start, window.end)
     except ProviderError as exc:
         result.error = exc
         return result
 
-    result.series.update(zip(missing, fetched))
-    result.fetched_locations = len(missing)
-    cache.set_many({keys[location]: series for location, series in zip(missing, fetched)}, CACHE_TTL_SECONDS)
+    # Keep whatever succeeded: a failed request (e.g. rate limit) only leaves its
+    # own locations missing, and missing is reported as unknown, never as Low.
+    succeeded = {location: series for location, series in zip(missing, fetched) if series is not None}
+    result.series.update(succeeded)
+    result.fetched_locations = len(succeeded)
+    cache.set_many({keys[location]: series for location, series in succeeded.items()}, CACHE_TTL_SECONDS)
     return result

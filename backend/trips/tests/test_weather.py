@@ -97,3 +97,64 @@ def test_hours_outside_window_are_missing():
     mock_open_meteo()
     result = fetch_forecasts(LOCATIONS, WINDOW)
     assert result.sample(LOCATIONS[0], WINDOW.end + timedelta(hours=1)) is None
+
+
+# --- Per-plan location budget (Open-Meteo counts every location) --------------
+
+from trips import weather as weather_module  # noqa: E402
+from trips.weather import (  # noqa: E402
+    LOCATION_BUDGET,
+    MAX_HEATMAP_POINTS,
+    MIN_HEATMAP_POINTS,
+    choose_snap_step,
+    heatmap_point_budget,
+)
+
+
+def _line(n, step_deg):
+    return [Coordinate(30.0 + i * step_deg, -100.0) for i in range(n)]
+
+
+def test_snap_step_stays_fine_when_within_budget():
+    assert choose_snap_step(_line(100, 0.1), 400) == 0.05
+
+
+def test_snap_step_coarsens_only_as_much_as_needed():
+    # 900 checkpoints ~10 mi apart along an east-west line (like a long 10-mi trip).
+    points = [Coordinate(40.0, -170.0 + i * 0.12) for i in range(900)]
+    step = choose_snap_step(points, 440)
+    assert step > 0.05
+    assert len({snap(p, step) for p in points}) <= 440
+    finer = weather_module.SNAP_OPTIONS_DEGREES[weather_module.SNAP_OPTIONS_DEGREES.index(step) - 1]
+    assert len({snap(p, finer) for p in points}) > 440
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_points", "expected"),
+    [(0, MAX_HEATMAP_POINTS), (200, MAX_HEATMAP_POINTS), (350, LOCATION_BUDGET - 350), (480, MIN_HEATMAP_POINTS)],
+)
+def test_heatmap_gets_remaining_budget(checkpoint_points, expected):
+    assert heatmap_point_budget(checkpoint_points) == expected
+
+
+def _rate_limit_second_chunk(request):
+    """First 100-location request succeeds; any request starting at latitude >= 40 gets 429."""
+    from urllib.parse import parse_qs, urlparse
+
+    from .open_meteo_fixtures import make_callback
+
+    first_lat = float(parse_qs(urlparse(request.url).query)["latitude"][0].split(",")[0])
+    if first_lat >= 40:
+        return 429, {"Content-Type": "application/json"}, '{"error": true, "reason": "Minutely API request limit exceeded."}'
+    return make_callback()(request)
+
+
+@responses.activate
+def test_rate_limited_chunk_only_blanks_its_own_locations():
+    responses.add_callback(responses.GET, URL_PATTERN, callback=_rate_limit_second_chunk)
+    locations = [Coordinate(30 + i * 0.1, -100) for i in range(200)]  # chunk 2 starts at lat 40
+    result = fetch_forecasts(locations, WINDOW)
+    assert isinstance(result.error, errors.ProviderRateLimited)
+    assert result.fetched_locations == 100
+    assert result.sample(locations[0], utc(2026, 10, 25, 15)) is not None
+    assert result.sample(locations[150], utc(2026, 10, 25, 15)) is None  # unknown, not Low

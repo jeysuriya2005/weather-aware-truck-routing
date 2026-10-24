@@ -54,6 +54,8 @@ export interface Checkpoint {
   lon: number
   eta: string
   forecast_time: string
+  /** Grid point whose forecast was used (checkpoints are snapped to 0.05 deg). */
+  forecast_point?: { lat: number; lon: number } | null
   status: 'ok' | 'unavailable'
   weather: CheckpointWeather | null
   risk: CheckpointRisk | null
@@ -125,6 +127,10 @@ export interface WeatherRiskStatus {
   provider: string
   checkpoints_total: number
   checkpoints_with_forecast: number
+  /** Grid checkpoint forecasts were read from: 0.05 normally, coarser for very long trips. */
+  forecast_grid_degrees?: number
+  /** Distinct forecast locations requested for this plan (provider limits apply per location). */
+  forecast_locations?: number
   window_start: string | null
   window_end: string | null
 }

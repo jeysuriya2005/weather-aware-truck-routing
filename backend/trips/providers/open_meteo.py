@@ -29,6 +29,7 @@ from ..domain.forecast import ForecastSample
 from ..domain.geometry import Coordinate
 from .errors import (
     ProviderBadResponse,
+    ProviderError,
     ProviderRateLimited,
     ProviderRejectedRequest,
     ProviderTimeout,
@@ -68,20 +69,43 @@ class OpenMeteoClient:
         self._base_url = base_url
 
     def fetch_hourly(self, locations: Sequence[Coordinate], start: datetime, end: datetime) -> list[Series]:
-        """Hourly samples for each location (input order), start..end inclusive (UTC hours)."""
+        """Hourly samples for each location (input order), start..end inclusive (UTC hours).
+        Raises the first provider error if any request fails."""
+        series, error = self.fetch_hourly_partial(locations, start, end)
+        if error is not None:
+            raise error
+        return series  # no error => every entry is a Series
+
+    def fetch_hourly_partial(
+        self, locations: Sequence[Coordinate], start: datetime, end: datetime
+    ) -> tuple[list[Series | None], ProviderError | None]:
+        """
+        Like fetch_hourly, but a failed request (e.g. HTTP 429) only blanks its own
+        locations (None) instead of discarding every forecast. Returns the first error.
+        """
         if not locations:
-            return []
+            return [], None
         if start.tzinfo is None or end.tzinfo is None or end < start:
             raise ValueError("start and end must be timezone-aware with start <= end")
         chunks = [
             list(locations[i : i + MAX_LOCATIONS_PER_REQUEST])
             for i in range(0, len(locations), MAX_LOCATIONS_PER_REQUEST)
         ]
+
+        def run(chunk: list[Coordinate]) -> tuple[list[Series | None], ProviderError | None]:
+            try:
+                return list(self._fetch_chunk(chunk, start, end)), None
+            except ProviderError as exc:
+                return [None] * len(chunk), exc
+
         if len(chunks) == 1:
-            return self._fetch_chunk(chunks[0], start, end)
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(chunks))) as pool:
-            results = list(pool.map(lambda chunk: self._fetch_chunk(chunk, start, end), chunks))
-        return [series for chunk_result in results for series in chunk_result]
+            results = [run(chunks[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(chunks))) as pool:
+                results = list(pool.map(run, chunks))
+        series = [item for chunk_series, _ in results for item in chunk_series]
+        error = next((err for _, err in results if err is not None), None)
+        return series, error
 
     def _fetch_chunk(self, locations: list[Coordinate], start: datetime, end: datetime) -> list[Series]:
         params = {
@@ -110,7 +134,17 @@ class OpenMeteoClient:
             reason = _error_reason(response)
             logger.warning("Open-Meteo failed: HTTP %s %s", response.status_code, reason or "")
             if response.status_code == 429:
-                raise ProviderRateLimited("The weather provider's rate limit was reached. Try again shortly.")
+                # Open-Meteo states which limit was hit (minutely / hourly / daily).
+                if reason and "daily" in reason.lower():
+                    raise ProviderRateLimited(
+                        "The weather provider's daily request limit for this server has been reached. "
+                        "Forecasts will be available again after 00:00 UTC."
+                    )
+                if reason and "hourly" in reason.lower():
+                    raise ProviderRateLimited(
+                        "The weather provider's hourly request limit was reached. Try again within the hour."
+                    )
+                raise ProviderRateLimited("The weather provider's rate limit was reached. Try again in a minute.")
             if response.status_code == 400:
                 raise ProviderRejectedRequest("The weather provider rejected the forecast request.")
             raise ProviderUnavailable("The weather provider is currently unavailable.")

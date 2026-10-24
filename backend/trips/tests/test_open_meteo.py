@@ -142,3 +142,20 @@ def test_rejects_naive_or_inverted_window():
 )
 def test_forecast_horizon_end(now, expected):
     assert forecast_horizon_end(now) == expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("Minutely API request limit exceeded. Please try again in one minute.", "Try again in a minute."),
+        ("Hourly API request limit exceeded. Please try again in the next hour.", "Try again within the hour."),
+        ("Daily API request limit exceeded. Please try again tomorrow.", "available again after 00:00 UTC"),
+    ],
+)
+@responses.activate
+def test_rate_limit_message_names_the_limit(reason, expected):
+    # Regression: a daily-limit 429 was reported as "try again shortly".
+    responses.add(responses.GET, URL_PATTERN, status=429, json={"error": True, "reason": reason})
+    with pytest.raises(errors.ProviderRateLimited) as raised:
+        OpenMeteoClient().fetch_hourly([DENVER], START, END)
+    assert expected in raised.value.message

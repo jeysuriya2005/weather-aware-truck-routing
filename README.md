@@ -13,7 +13,7 @@ load weight, and recommends the safest option. Routes, checkpoints, risk and a
 - **Mapping:** MapLibre GL JS 6 + OpenFreeMap vector tiles ("Liberty" style)
 - **Routing and geocoding:** TomTom Routing API (truck mode) + TomTom Geocoding API
 - **Weather:** Open-Meteo hourly forecast API
-- **Testing:** pytest + pytest-django + responses (backend); Vitest + Testing Library + jsdom (frontend); oxlint
+- **Testing:** pytest + pytest-django + responses (backend); Vitest + Testing Library + jsdom (frontend); Playwright browser tests (mocked and live); oxlint; independent live data audit ([qa/audit_live_plan.py](qa/audit_live_plan.py))
 
 > **Project status:** the features are implemented and tested locally. The app
 > is **not deployed**: there is no hosted URL yet, and the Loom walkthrough
@@ -84,7 +84,10 @@ which route exposes me to the least dangerous weather?**
 | Checkpoint risk dots, popups and a checkpoint list with full details | ✅ | [BaseMap.tsx](frontend/src/components/BaseMap.tsx), [CheckpointList.tsx](frontend/src/components/CheckpointList.tsx) |
 | Corridor weather-risk heatmap with a **0–48 h after departure** slider | ✅ | [corridor.py](backend/trips/domain/corridor.py), [HeatmapControl.tsx](frontend/src/components/HeatmapControl.tsx) |
 | Risk legend; "No forecast" shown separately from Low | ✅ | [RiskLegend.tsx](frontend/src/components/RiskLegend.tsx) |
-| Loading, empty, validation and error states; backend health badge | ✅ | [App.tsx](frontend/src/App.tsx), [api_errors.py](backend/trips/api_errors.py) |
+| Route comparison cards: distance, drive time, ETA, average risk, High and Severe+ miles, forecast coverage, risk-distribution bar | ✅ | [RouteList.tsx](frontend/src/components/RouteList.tsx), [RiskBar.tsx](frontend/src/components/RiskBar.tsx) |
+| Route weather panel: peak wind/gust, rain, snow (with mile and ETA), worst risk, High-or-worse miles, coverage, hazard stretches | ✅ | [RouteInsights.tsx](frontend/src/components/RouteInsights.tsx), [insights.ts](frontend/src/lib/insights.ts) |
+| Loading (real elapsed time), empty, validation (incl. server field reasons) and error states; service status pills | ✅ | [App.tsx](frontend/src/App.tsx), [apiErrors.ts](frontend/src/lib/apiErrors.ts), [api_errors.py](backend/trips/api_errors.py) |
+| Responsive dashboard: 3 columns ≥ 1440 px, 2 columns on laptops/tablets, single column (map right after the form) on phones | ✅ | [index.css](frontend/src/index.css) |
 | Hosted deployment | ❌ Not done | See [Deployment guide](#deployment-guide) |
 
 ---
@@ -106,6 +109,8 @@ and [`requirements-dev.txt`](backend/requirements-dev.txt), or installed from
 | Styling | Plain CSS ([index.css](frontend/src/index.css)) | No UI component library |
 | HTTP client | Browser `fetch` in [client.ts](frontend/src/api/client.ts) | Typed API calls, `AbortController` cancellation, uniform `ApiError` |
 | Frontend tests | Vitest `5.0`, `@testing-library/react` `16`, `@testing-library/dom`, `jsdom` `30` | Unit tests (Node) and component tests (jsdom) |
+| Browser tests | `@playwright/test` `1.64` ([playwright.config.ts](frontend/playwright.config.ts)) | Real Chrome: mocked-API journeys and responsive checks, plus an opt-in live journey |
+| Icons | Inline SVG ([Icon.tsx](frontend/src/components/Icon.tsx)) | Drawn for this app; no icon library |
 | Frontend lint | `oxlint` `1.8x` ([.oxlintrc.json](frontend/.oxlintrc.json)) | React, TypeScript and oxc rules |
 | Backend language | Python **3.12+** (Django 6.1 requires it; developed on 3.13.15) | — |
 | Web framework | Django `6.1.2` | Settings, URL routing, middleware; no database or models |
@@ -189,8 +194,12 @@ API's `{ "error": { "code", "message" } }` body.
    ([tomtom.py](backend/trips/providers/tomtom.py)).
 3. **Checkpoints and ETAs** are computed along the *full* server-side geometry
    ([checkpoints.py](backend/trips/domain/checkpoints.py)).
-4. **Heatmap grid.** A bounded corridor grid of at most 200 points is built
-   around all routes ([corridor.py](backend/trips/domain/corridor.py)).
+4. **Location budget and heatmap grid.** Open-Meteo counts every location
+   against its 600-per-minute limit, so each plan is capped at **500
+   locations**. Checkpoints get priority. The heatmap is a bounded corridor
+   grid built from what's left: up to 200 points, at least 60
+   ([weather.py](backend/trips/weather.py),
+   [corridor.py](backend/trips/domain/corridor.py)).
 5. **Forecasts.** One deduplicated, cached forecast lookup covers all
    checkpoint and grid locations: 100 locations per Open-Meteo request, up to
    4 requests in parallel ([weather.py](backend/trips/weather.py),
@@ -272,7 +281,12 @@ so nothing is re-requested or re-uploaded.
   An unexpected unit is treated as a provider error.
 - **Location snapping.** Checkpoint lookups are snapped to a 0.05° grid
   (about 5 km), so nearby checkpoints and overlapping routes share one
-  forecast.
+  forecast. A very long trip may need more distinct points than the 500
+  location budget allows: for example, coast to coast at 10 mi needs about
+  890. In that case the lookup grid coarsens just enough (0.1°, 0.15°, …).
+  Checkpoints and ETAs stay every N miles; only the forecast point each one
+  reads from changes. The response reports `forecast_grid_degrees` and each
+  checkpoint's `forecast_point`, and the UI shows a notice.
 
 ### Weather and load weight
 
@@ -295,7 +309,8 @@ Route C)."*
 - **Grid.** A grid aligned to fixed multiples of the spacing covers a
   corridor about 30 km wide around all routes. The spacing is the finest of
   0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75 or 1.0° that keeps the grid at
-  **≤ 200 points**. Short trips get a fine grid, for example 0.15° for Dallas
+  **≤ 200 points**, or fewer when checkpoints use most of the 500-location
+  budget (minimum 60). Short trips get a fine grid, for example 0.15° for Dallas
   → Oklahoma City; long trips get a coarse one, for example 0.5° for Chicago →
   Denver.
 - **Frames.** Frame *h* (0–48) is the forecast for **departure + h hours**,
@@ -317,6 +332,7 @@ Route C)."*
 | Node.js | **22.12+ or 24.x** (developed on 24.19.0) | Vitest 5 requires `^22.12 \|\| ^24 \|\| >=26`; Vite 8 requires `^20.19 \|\| >=22.12` |
 | npm | Bundled with Node (developed on 11.17) | Frontend packages |
 | Git | Any recent version | Version control |
+| Google Chrome | Any current version | Playwright browser tests use the installed Chrome (`PW_CHANNEL` to change); no browser download needed |
 | TomTom developer account | Free tier | `TOMTOM_API_KEY` for routing and geocoding: https://developer.tomtom.com/ |
 
 Open-Meteo and OpenFreeMap need no account.
@@ -328,7 +344,11 @@ Open-Meteo and OpenFreeMap need no account.
 ```
 weather-prediction/
 ├── README.md
+├── QA_AUDIT_REPORT.md            # data-accuracy audit, browser QA, UI redesign results
 ├── .gitignore
+├── qa/
+│   ├── audit_live_plan.py        # independent live audit of every plan value (stdlib only)
+│   └── screenshots/              # before/after UI screenshots used in the report
 ├── backend/
 │   ├── manage.py
 │   ├── requirements.txt          # runtime dependencies (pinned)
@@ -363,21 +383,26 @@ weather-prediction/
 │       │   └── errors.py         # user-safe provider errors
 │       └── tests/                # pytest suite + TomTom / Open-Meteo mocks
 └── frontend/
-    ├── package.json              # scripts: dev, build, lint, preview, test
+    ├── package.json              # scripts: dev, build, lint, preview, test, test:e2e, test:e2e:live
     ├── vite.config.ts            # React plugin + /api proxy to :8000
+    ├── playwright.config.ts      # browser tests (port 5174, installed Chrome)
     ├── .oxlintrc.json            # lint rules
     ├── .env.example              # VITE_API_BASE_URL (public, not secret)
     ├── index.html
+    ├── e2e/                      # Playwright: app.e2e.ts, responsive.e2e.ts (mocked),
+    │                             # live.e2e.ts (opt-in), fixtures.ts, helpers.ts
     └── src/
-        ├── main.tsx, App.tsx     # app shell and page state
+        ├── main.tsx, App.tsx     # dashboard shell and page state
         ├── config.ts             # API base URL, map style, initial view
-        ├── index.css             # all styles
+        ├── index.css             # design tokens + all styles
         ├── api/                  # client.ts (fetch) + types.ts (response types)
-        ├── components/           # TripForm, LocationAutocomplete, RecommendationPanel,
-        │                         # RouteList, CheckpointList, HeatmapControl, RiskLegend,
-        │                         # RiskBadge, BaseMap (+ components.test.tsx)
-        ├── lib/                  # units, datetime, risk palette, heatmap, checkpoints,
-        │                         # routeColors (+ unit tests)
+        ├── components/           # AppHeader, TripForm, LocationAutocomplete, RecommendationPanel,
+        │                         # RouteList, RouteInsights, CheckpointList, HeatmapControl,
+        │                         # RiskLegend, RiskBadge, RiskBar, MapStatus, ErrorNotice, Icon,
+        │                         # BaseMap (+ components.test.tsx)
+        ├── hooks/                # useMediaQuery, useElapsedSeconds
+        ├── lib/                  # units, datetime, risk palette, heatmap, checkpoints, insights,
+        │                         # apiErrors, routeColors (+ unit tests)
         └── test/fixtures.ts      # shared test data
 ```
 
@@ -572,6 +597,7 @@ are shown:
           "lon": -97.1815,
           "eta": "2026-10-24T07:46:22-05:00",
           "forecast_time": "2026-10-24T13:00:00+00:00",
+          "forecast_point": { "lat": 33.35, "lon": -97.2 },
           "status": "ok",
           "weather": { "wind_mph": 3.3, "wind_gust_mph": 3.4, "rain_in_per_hr": 0.0, "snow_in_per_hr": 0.0 },
           "risk": {
@@ -648,6 +674,7 @@ are shown:
 |---|---|
 | Risk codes | `low`, `moderate`, `high`, `severe`, `no_travel`. Heatmap `risk` uses scores 0–4, where `null` means no forecast. |
 | `checkpoint.status` | `ok` or `unavailable`. When `unavailable`, `weather` and `risk` are `null`. |
+| `checkpoint.forecast_point` | The grid point whose forecast was used: 0.05° normally, coarser only for very long trips (see `weather_risk.forecast_grid_degrees`) |
 | `checkpoint.hazards` | Which of `wind`, `rain`, `snow` set the overall level (when above Low) |
 | `checkpoint.warnings` | Text warnings, e.g. load-rule upgrades, No Travel causes, or "Forecast unavailable … risk is unknown, not low." |
 | `hazard_stretches` | Consecutive checkpoints at High or worse with the same level, merged into mile ranges |
@@ -814,18 +841,38 @@ cd backend
 cd frontend
 npm test              # vitest run (unit + jsdom component tests)
 npm run lint          # oxlint
-npm run build         # tsc -b type-check + production bundle in dist/
+npm run build         # tsc -b type-check (app + e2e) + production bundle in dist/
 npm run preview       # serve the production build locally (proxies /api like dev)
+
+# Browser tests (Playwright, installed Chrome; starts its own Vite server on :5174)
+npm run test:e2e                                   # mocked API: journeys, errors, responsive layouts
+$env:E2E_LIVE = "1"; npm run test:e2e:live         # LIVE: needs the backend on :8000 with TOMTOM_API_KEY
 ```
 
-**Results observed on 2026-10-23:**
+**Independent live data audit.** [qa/audit_live_plan.py](qa/audit_live_plan.py)
+plans one real trip through a running backend, then re-derives every value
+without importing application code. It checks units, checkpoint spacing and
+segments, ETAs, forecasts re-fetched from Open-Meteo, risk levels, summaries,
+ranking and the heatmap. It uses the Python standard library only.
+
+```powershell
+backend\.venv\Scripts\python.exe qa\audit_live_plan.py                     # Dallas -> Denver, 25 mi, 42,000 lb
+backend\.venv\Scripts\python.exe qa\audit_live_plan.py --interval 10 --load 45000 --origin 39.7392,-104.9903 --destination 40.7608,-111.8910
+```
+
+See [QA_AUDIT_REPORT.md](QA_AUDIT_REPORT.md) for the latest results.
+
+**Results observed on 2026-10-24** (details in [QA_AUDIT_REPORT.md](QA_AUDIT_REPORT.md)):
 
 | Check | Result |
 |---|---|
-| Backend tests | **387 passed** |
-| Frontend tests | **41 passed** (3 files) |
-| Lint | No warnings or errors |
-| Build | Succeeds. Vite warns that the main chunk is over 500 kB (about 1.3 MB, 364 kB gzipped), almost all of it MapLibre. |
+| Backend tests | **411 passed** |
+| Frontend tests (Vitest) | **79 passed** (5 files) |
+| TypeScript (`tsc -b`, app + e2e) | 0 errors |
+| Lint (oxlint) | No warnings or errors |
+| Playwright, mocked | **21 passed** (1 worker, the default) |
+| Playwright, live | **1 passed** (real TomTom + Open-Meteo journey; UI matched the API) |
+| Build | Succeeds. Vite warns that the main chunk is over 500 kB (about 1.3 MB, 369 kB gzipped), almost all of it MapLibre. |
 
 **What the backend tests cover:**
 - every threshold edge and every load-rule boundary;
@@ -962,7 +1009,9 @@ Frontend variables are public by design, so none of them may be secret.
 - **US only.** Geocoding is limited to the US (`countrySet=US`).
 - **Approximate resolution.**
   - Forecasts describe weather-model grid cells, not exact road points.
-  - Checkpoint lookups are snapped to 0.05° (about 5 km).
+  - Checkpoint lookups are snapped to 0.05° (about 5 km). Very long trips
+    at short intervals use a coarser lookup grid to fit the provider's limits
+    (see `forecast_grid_degrees`).
   - The heatmap uses at most 200 cells, so long trips get a coarse grid (up
     to 1.0°).
 - **Travel-time assumptions.** ETAs use TomTom's travel time, including
@@ -978,8 +1027,20 @@ Frontend variables are public by design, so none of them may be secret.
 - **Per-process cache.** The forecast cache and throttle counters aren't
   shared between processes.
 
+- **Open-Meteo counts every location in a request against its limits.**
+  This was confirmed on 2026-10-24: bursts of 100-location requests got
+  `429 Minutely API request limit exceeded`. Each plan is therefore capped
+  at 500 locations, and one plan on its own always fits. Two uncached plans
+  within a minute can still hit the 600/min limit. Any batch that's
+  rate-limited leaves only *its own* checkpoints unknown, never shown as Low.
+  If every batch fails, no route is recommended.
+- **Forecast hand-over hour.** At the hour where Open-Meteo's series switches
+  from NOAA HRRR to GFS (about 39–40 h ahead), the value differs depending on
+  whether a request *ends* on that hour or continues past it. The app always
+  requests one continuous window, so its values are internally consistent,
+  but a one-off query for that single hour can differ slightly.
+
 **Needs further validation:**
-- How Open-Meteo counts multi-location requests against its free limits.
 - TomTom's terms for commercial use of the free tier.
 - Behaviour behind a production reverse proxy (HTTPS headers, client IPs for
   throttling).

@@ -13,8 +13,8 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import type { FeatureCollection, LineString, Point } from 'geojson'
 import type { Checkpoint, Heatmap, RouteOption } from '../api/types'
 import { INITIAL_VIEW, MAP_STYLE_URL } from '../config'
-import { checkpointRows } from '../lib/checkpoints'
 import {
+  frameForForecastHour,
   heatmapColorExpression,
   heatmapFeatures,
   heatmapOpacityExpression,
@@ -22,7 +22,7 @@ import {
   meanLatitude,
   riskColorMatch,
 } from '../lib/heatmap'
-import { riskLabel } from '../lib/risk'
+import { cellPopupContent, checkpointPopupContent } from '../lib/mapPopups'
 import { routeColor } from '../lib/routeColors'
 
 // MapLibre v6 loads its worker from a file next to its own module. Vite
@@ -34,6 +34,7 @@ const ROUTES_SOURCE = 'routes'
 const ROUTES_CASING_LAYER = 'routes-casing'
 const ROUTES_LINE_LAYER = 'routes-line'
 const ROUTES_SELECTED_LAYER = 'routes-selected'
+const ROUTES_SELECTED_CASING_LAYER = 'routes-selected-casing'
 const HEATMAP_SOURCE = 'heatmap'
 const HEATMAP_LAYER = 'heatmap-cells'
 const CHECKPOINTS_SOURCE = 'checkpoints'
@@ -53,6 +54,10 @@ interface Props {
   showHeatmap?: boolean
   selectedCheckpoint?: number | null
   onSelectCheckpoint?: (index: number | null) => void
+  /** Requested departure (ISO); overlay frame N = departure + N hours. */
+  departureTime?: string | null
+  /** Move the overlay slider (used by "show shading at this checkpoint's ETA"). */
+  onShowFrame?: (frame: number) => void
 }
 
 function toFeatureCollection(routes: RouteOption[]): FeatureCollection<LineString> {
@@ -77,33 +82,6 @@ function checkpointFeatures(checkpoints: Checkpoint[]): FeatureCollection<Point>
   }
 }
 
-/** Popup content built from text nodes only (no HTML injection). */
-function popupContent(routeLabel: string, cp: Checkpoint): HTMLElement {
-  const root = document.createElement('div')
-  root.className = 'checkpoint-popup'
-  const title = document.createElement('strong')
-  title.textContent = `${routeLabel} · checkpoint ${cp.index + 1}: ${riskLabel(cp.risk?.overall ?? null)}`
-  root.append(title)
-  const list = document.createElement('dl')
-  for (const row of checkpointRows(cp)) {
-    const item = document.createElement('div')
-    const dt = document.createElement('dt')
-    dt.textContent = row.label
-    const dd = document.createElement('dd')
-    dd.textContent = row.value
-    item.append(dt, dd)
-    list.append(item)
-  }
-  root.append(list)
-  for (const warning of cp.warnings) {
-    const p = document.createElement('p')
-    p.className = 'checkpoint-popup__warning'
-    p.textContent = warning
-    root.append(p)
-  }
-  return root
-}
-
 export function BaseMap({
   routes = [],
   selectedRouteId = null,
@@ -113,18 +91,29 @@ export function BaseMap({
   showHeatmap = true,
   selectedCheckpoint = null,
   onSelectCheckpoint,
+  departureTime = null,
+  onShowFrame,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const popupRef = useRef<Popup | null>(null)
+  const cellPopupRef = useRef<{ popup: Popup; index: number } | null>(null)
   const onSelectRef = useRef(onSelectRoute)
   const onSelectCheckpointRef = useRef(onSelectCheckpoint)
+  const onShowFrameRef = useRef(onShowFrame)
+  // Latest overlay state for map event handlers registered once at load.
+  const overlayRef = useRef({ heatmap, frame: heatmapFrame, departureTime })
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
     onSelectRef.current = onSelectRoute
     onSelectCheckpointRef.current = onSelectCheckpoint
-  }, [onSelectRoute, onSelectCheckpoint])
+    onShowFrameRef.current = onShowFrame
+  }, [onSelectRoute, onSelectCheckpoint, onShowFrame])
+
+  useEffect(() => {
+    overlayRef.current = { heatmap, frame: heatmapFrame, departureTime }
+  }, [heatmap, heatmapFrame, departureTime])
 
   // Create the map once.
   useEffect(() => {
@@ -167,16 +156,24 @@ export function BaseMap({
         type: 'line',
         source: ROUTES_SOURCE,
         layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': ['get', 'color'], 'line-width': 4, 'line-opacity': 0.55 },
+        paint: { 'line-color': ['get', 'color'], 'line-width': 4, 'line-opacity': 0.6 },
       })
-      // The selected route is redrawn on top, wider and fully opaque.
+      // The selected route is redrawn on top: a wide white halo, then the line itself.
+      map.addLayer({
+        id: ROUTES_SELECTED_CASING_LAYER,
+        type: 'line',
+        source: ROUTES_SOURCE,
+        filter: ['==', ['get', 'id'], ''],
+        layout: { 'line-join': 'round', 'line-cap': 'round' },
+        paint: { 'line-color': '#ffffff', 'line-width': 11, 'line-opacity': 0.95 },
+      })
       map.addLayer({
         id: ROUTES_SELECTED_LAYER,
         type: 'line',
         source: ROUTES_SOURCE,
         filter: ['==', ['get', 'id'], ''],
         layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': ['get', 'color'], 'line-width': 6, 'line-opacity': 1 },
+        paint: { 'line-color': ['get', 'color'], 'line-width': 6.5, 'line-opacity': 1 },
       })
 
       map.addSource(CHECKPOINTS_SOURCE, { type: 'geojson', data: EMPTY })
@@ -186,9 +183,9 @@ export function BaseMap({
         source: CHECKPOINTS_SOURCE,
         paint: {
           'circle-color': CHECKPOINT_COLOR,
-          'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 3.5, 9, 7],
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 4.5, 9, 8],
           'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1.5,
+          'circle-stroke-width': 2,
         },
       })
       map.addLayer({
@@ -198,9 +195,9 @@ export function BaseMap({
         filter: ['==', ['get', 'index'], -1],
         paint: {
           'circle-color': CHECKPOINT_COLOR,
-          'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 7, 9, 11],
-          'circle-stroke-color': '#1f2933',
-          'circle-stroke-width': 2.5,
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 4, 8, 9, 12],
+          'circle-stroke-color': '#0f172a',
+          'circle-stroke-width': 3,
         },
       })
 
@@ -216,6 +213,28 @@ export function BaseMap({
         const index = event.features?.[0]?.properties?.index
         if (typeof index === 'number') onSelectCheckpointRef.current?.(index)
       })
+      // Clicking shaded corridor (not a route or checkpoint) shows that cell's forecast.
+      map.on('click', HEATMAP_LAYER, (event) => {
+        const above = map.queryRenderedFeatures(event.point, {
+          layers: [CHECKPOINTS_LAYER, ROUTES_LINE_LAYER, ROUTES_SELECTED_LAYER],
+        })
+        const index = event.features?.[0]?.properties?.i
+        const { heatmap: data, frame, departureTime: departure } = overlayRef.current
+        if (above.length || typeof index !== 'number' || !data || !departure) return
+        cellPopupRef.current?.popup.remove()
+        // One map popup at a time: closing the checkpoint popup also clears the selection.
+        popupRef.current?.remove()
+        const popup = new Popup({ maxWidth: '300px', offset: 8 })
+          .setLngLat(event.lngLat)
+          .setDOMContent(cellPopupContent(data, departure, frame, index))
+          .addTo(map)
+        popup.on('close', () => {
+          if (cellPopupRef.current?.popup === popup) cellPopupRef.current = null
+        })
+        cellPopupRef.current = { popup, index }
+      })
+      map.on('mouseenter', HEATMAP_LAYER, () => (map.getCanvas().style.cursor = 'help'))
+      map.on('mouseleave', HEATMAP_LAYER, () => (map.getCanvas().style.cursor = ''))
       for (const layer of [ROUTES_LINE_LAYER, ROUTES_SELECTED_LAYER, CHECKPOINTS_LAYER]) {
         map.on('mouseenter', layer, () => (map.getCanvas().style.cursor = 'pointer'))
         map.on('mouseleave', layer, () => (map.getCanvas().style.cursor = ''))
@@ -243,6 +262,10 @@ export function BaseMap({
     for (const route of routes) {
       for (const coordinate of route.geometry.coordinates) bounds.extend(coordinate)
     }
+    // The layout can change in the same render (e.g. the route-weather column
+    // appears), and MapLibre only learns the new container size asynchronously.
+    // Resize first so the fit uses the real width; otherwise routes get cut off.
+    map.resize()
     map.fitBounds(bounds, { padding: 60, duration: 600 })
   }, [ready, routes])
 
@@ -250,7 +273,9 @@ export function BaseMap({
   useEffect(() => {
     const map = mapRef.current
     if (!ready || !map) return
-    map.setFilter(ROUTES_SELECTED_LAYER, ['==', ['get', 'id'], selectedRouteId ?? ''])
+    for (const layer of [ROUTES_SELECTED_CASING_LAYER, ROUTES_SELECTED_LAYER]) {
+      map.setFilter(layer, ['==', ['get', 'id'], selectedRouteId ?? ''])
+    }
   }, [ready, selectedRouteId])
 
   // Heatmap data: uploaded once per plan.
@@ -271,7 +296,19 @@ export function BaseMap({
     if (!ready || !map) return
     map.setPaintProperty(HEATMAP_LAYER, 'circle-color', heatmapColorExpression(heatmapFrame))
     map.setPaintProperty(HEATMAP_LAYER, 'circle-opacity', heatmapOpacityExpression(heatmapFrame))
-  }, [ready, heatmapFrame])
+    // An open cell popup follows the slider, so it always describes the visible shading.
+    const open = cellPopupRef.current
+    if (open && heatmap && departureTime) {
+      open.popup.setDOMContent(cellPopupContent(heatmap, departureTime, heatmapFrame, open.index))
+    }
+  }, [ready, heatmapFrame, heatmap, departureTime])
+
+  // A new plan invalidates any open cell popup.
+  useEffect(() => {
+    const open = cellPopupRef.current
+    cellPopupRef.current = null
+    open?.popup.remove()
+  }, [heatmap])
 
   useEffect(() => {
     const map = mapRef.current
@@ -301,16 +338,28 @@ export function BaseMap({
 
     const cp = selectedRoute?.checkpoints.find((c) => c.index === selectedCheckpoint)
     if (!selectedRoute || !cp) return
+    // One map popup at a time: a checkpoint popup replaces any open cell popup.
+    const cell = cellPopupRef.current
+    cellPopupRef.current = null
+    cell?.popup.remove()
     const popup = new Popup({ maxWidth: '320px', offset: 12 })
       .setLngLat([cp.lon, cp.lat])
-      .setDOMContent(popupContent(selectedRoute.label, cp))
+      .setDOMContent(
+        checkpointPopupContent(
+          selectedRoute.label,
+          cp,
+          heatmap ? frameForForecastHour(heatmap, cp.forecast_time) : null,
+          (frame) => onShowFrameRef.current?.(frame),
+        ),
+      )
       .addTo(map)
     popup.on('close', () => {
       if (popupRef.current === popup) onSelectCheckpointRef.current?.(null)
     })
     popupRef.current = popup
     if (!map.getBounds().contains([cp.lon, cp.lat])) map.panTo([cp.lon, cp.lat])
-  }, [ready, selectedRoute, selectedCheckpoint])
+  }, [ready, selectedRoute, selectedCheckpoint, heatmap])
 
-  return <div ref={containerRef} className="map" aria-label="Route map" />
+  // data-map-ready lets browser tests wait for the style/layers before interacting.
+  return <div ref={containerRef} className="map" aria-label="Route map" data-map-ready={ready} />
 }
