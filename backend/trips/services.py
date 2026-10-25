@@ -163,6 +163,7 @@ def _weather_status(
 ) -> dict:
     total = sum(len(a.assessed) for a in analyses)
     known = sum(a.known_checkpoints for a in analyses)
+    reason = None
     if known == total:
         status, message = "complete", "Forecasts are available for every checkpoint."
         if snap_step > CHECKPOINT_SNAP_DEGREES:
@@ -173,17 +174,27 @@ def _weather_status(
     elif known == 0:
         status = "unavailable"
         if forecasts.error is not None:
+            reason = forecasts.error.code
             message = f"{forecasts.error.message} Route risk cannot be assessed; no route is recommended."
+        elif window is None:
+            reason = "beyond_forecast_horizon"
+            message = "The departure is beyond the weather provider's forecast range. Route risk cannot be assessed."
         else:
+            reason = "no_forecast_data"
             message = "Forecasts are unavailable for these arrival times. Route risk cannot be assessed."
     else:
         status = "partial"
+        reason = forecasts.error.code if forecasts.error is not None else "forecast_gaps"
         message = (
             f"Forecasts are missing for {total - known} of {total} checkpoints; "
             "those segments are unknown risk, not low risk."
         )
     return {
         "status": status,
+        # Machine-readable cause when not complete: a provider error code (e.g.
+        # provider_rate_limited, provider_timeout), beyond_forecast_horizon,
+        # no_forecast_data or forecast_gaps. None when complete.
+        "reason": reason,
         "message": message,
         "provider": WEATHER_PROVIDER,
         "checkpoints_total": total,

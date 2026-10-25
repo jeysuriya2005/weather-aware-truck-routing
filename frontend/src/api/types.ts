@@ -123,6 +123,8 @@ export interface Recommendation {
 
 export interface WeatherRiskStatus {
   status: 'complete' | 'partial' | 'unavailable'
+  /** Why forecasts are not complete (e.g. provider_rate_limited, provider_timeout); null when complete. */
+  reason?: string | null
   message: string
   provider: string
   checkpoints_total: number

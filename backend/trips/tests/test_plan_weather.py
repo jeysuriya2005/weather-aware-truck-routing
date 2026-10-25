@@ -291,8 +291,74 @@ def test_rate_limited_batch_gives_partial_forecasts_not_zero():
     status = data["weather_risk"]
     # Before the fix one 429 discarded every forecast (0/N, "unavailable").
     assert status["status"] == "partial"
+    assert status["reason"] == "provider_rate_limited"
     assert 0 < status["checkpoints_with_forecast"] < status["checkpoints_total"]
     assert data["recommendation"]["status"] != "unavailable"
     assert data["recommendation"]["coverage_complete"] is False
     unknown = [cp for r in data["routes"] for cp in r["checkpoints"] if cp["status"] == "unavailable"]
     assert unknown and all(cp["risk"] is None for cp in unknown)
+
+
+# --- Diagnosing "weather unavailable" (reason code + one safe summary log line) ---
+
+import logging  # noqa: E402
+
+from .open_meteo_fixtures import UNITS  # noqa: E402
+
+_RATE_DAILY = {"status": 429, "json": {"error": True, "reason": "Daily API request limit exceeded. Please try again tomorrow."}}
+
+
+@pytest.mark.parametrize(
+    ("mock", "reason", "message_part"),
+    [
+        pytest.param({"body": requests.ReadTimeout("slow")}, "provider_timeout", "did not respond in time", id="timeout"),
+        pytest.param({"body": requests.ConnectionError("dns")}, "provider_unavailable", "currently unavailable", id="network"),
+        pytest.param(_RATE_DAILY, "provider_rate_limited", "after 00:00 UTC", id="daily-quota"),
+        pytest.param({"status": 500, "body": ""}, "provider_unavailable", "currently unavailable", id="server-error"),
+        pytest.param({"status": 200, "body": "<html>proxy</html>"}, "provider_bad_response", "unexpected response", id="not-json"),
+    ],
+)
+@responses.activate
+def test_unavailable_weather_reports_reason_and_logs_cause(caplog, mock, reason, message_part):
+    add_routes(2)
+    responses.add(responses.GET, URL_PATTERN, **mock)
+    with caplog.at_level(logging.INFO, logger="trips"):
+        data = plan()
+    weather = data["weather_risk"]
+    assert weather["status"] == "unavailable" and weather["reason"] == reason
+    assert message_part in weather["message"]
+    assert data["heatmap"]["status"] == "unavailable"  # same single fetch
+    assert data["recommendation"]["status"] == "unavailable" and data["recommendation"]["route_id"] is None
+    summary = [r for r in caplog.records if r.getMessage().startswith("Forecast fetch:")]
+    assert len(summary) == 1 and summary[0].levelno == logging.WARNING
+    text = summary[0].getMessage()
+    assert f"{weather['forecast_locations']} locations requested" in text and "0 fetched" in text
+    assert "error Provider" in text
+    assert "test-tomtom-key-not-real" not in caplog.text  # no secrets in logs
+
+
+@responses.activate
+def test_unexpected_units_are_a_reported_bad_response_not_low_risk(caplog):
+    add_routes(2)
+    mock_open_meteo(units={**UNITS, "wind_speed_10m": "km/h"})
+    data = plan()
+    assert data["weather_risk"]["status"] == "unavailable"
+    assert data["weather_risk"]["reason"] == "provider_bad_response"
+    assert all(cp["risk"] is None for r in data["routes"] for cp in r["checkpoints"])
+
+
+@responses.activate
+def test_complete_weather_has_no_reason_and_logs_counts(caplog):
+    add_routes(2)
+    mock_open_meteo()
+    with caplog.at_level(logging.INFO, logger="trips"):
+        data = plan()
+    assert data["weather_risk"]["status"] == "complete" and data["weather_risk"]["reason"] is None
+    summary = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Forecast fetch:")]
+    assert summary and "0 failed" in summary[0] and "error" not in summary[0]
+    # Repeat plan: served from cache, still logged.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="trips"):
+        plan()
+    again = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Forecast fetch:")]
+    assert again and " 0 fetched" in again[0]

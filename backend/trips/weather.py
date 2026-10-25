@@ -11,6 +11,7 @@ are reported as unavailable, never as Low risk.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from .domain.forecast import ForecastSample, forecast_hour_for
 from .domain.geometry import Coordinate
 from .providers.errors import ProviderError
 from .providers.open_meteo import OpenMeteoClient, Series, forecast_horizon_end
+
+logger = logging.getLogger(__name__)
 
 HEATMAP_HOURS = 48
 CACHE_TTL_SECONDS = 30 * 60  # models update hourly; keep reuse short
@@ -84,6 +87,8 @@ class ForecastResult:
     error: ProviderError | None = None
     cached_locations: int = 0
     fetched_locations: int = 0
+    requested_locations: int = 0
+    failed_locations: int = 0
 
     def sample(self, location: Coordinate, hour: datetime) -> ForecastSample | None:
         return self.series.get(location, {}).get(hour)
@@ -102,8 +107,11 @@ def fetch_forecasts(
     client: OpenMeteoClient | None = None,
 ) -> ForecastResult:
     unique = list(dict.fromkeys(locations))
-    result = ForecastResult()
-    if window is None or not unique:
+    result = ForecastResult(requested_locations=len(unique))
+    if window is None:
+        logger.warning("Forecast fetch skipped: departure window is beyond the provider's forecast horizon")
+        return result
+    if not unique:
         return result
 
     keys = {location: _cache_key(location, window) for location in unique}
@@ -114,18 +122,36 @@ def fetch_forecasts(
     result.cached_locations = len(result.series)
 
     missing = [location for location in unique if location not in result.series]
-    if not missing:
-        return result
-    try:
-        fetched, result.error = (client or OpenMeteoClient()).fetch_hourly_partial(missing, window.start, window.end)
-    except ProviderError as exc:
-        result.error = exc
-        return result
+    if missing:
+        try:
+            fetched, result.error = (client or OpenMeteoClient()).fetch_hourly_partial(missing, window.start, window.end)
+        except ProviderError as exc:
+            result.error = exc
+            fetched = [None] * len(missing)
 
-    # Keep whatever succeeded: a failed request (e.g. rate limit) only leaves its
-    # own locations missing, and missing is reported as unknown, never as Low.
-    succeeded = {location: series for location, series in zip(missing, fetched) if series is not None}
-    result.series.update(succeeded)
-    result.fetched_locations = len(succeeded)
-    cache.set_many({keys[location]: series for location, series in succeeded.items()}, CACHE_TTL_SECONDS)
+        # Keep whatever succeeded: a failed request (e.g. rate limit) only leaves its
+        # own locations missing, and missing is reported as unknown, never as Low.
+        succeeded = {location: series for location, series in zip(missing, fetched) if series is not None}
+        result.series.update(succeeded)
+        result.fetched_locations = len(succeeded)
+        result.failed_locations = len(missing) - len(succeeded)
+        cache.set_many({keys[location]: series for location, series in succeeded.items()}, CACHE_TTL_SECONDS)
+
+    _log_summary(result, window)
     return result
+
+
+def _log_summary(result: ForecastResult, window: ForecastWindow) -> None:
+    """One line per plan for production diagnosis. Contains no secrets (Open-Meteo uses no key)."""
+    level = logging.WARNING if result.error else logging.INFO
+    logger.log(
+        level,
+        "Forecast fetch: %d locations requested, %d cached, %d fetched, %d failed; window %s..%s UTC%s",
+        result.requested_locations,
+        result.cached_locations,
+        result.fetched_locations,
+        result.failed_locations,
+        f"{window.start:%Y-%m-%dT%H:%M}",
+        f"{window.end:%Y-%m-%dT%H:%M}",
+        f"; error {type(result.error).__name__}: {result.error.message}" if result.error else "",
+    )
