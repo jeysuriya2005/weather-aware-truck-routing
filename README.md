@@ -892,37 +892,55 @@ See [QA_AUDIT_REPORT.md](QA_AUDIT_REPORT.md) for the latest results.
 
 The app hasn't been deployed. These are the requirements for doing it.
 
-### Backend (Django API)
+### Backend (Django API) on Render (Free Web Service)
 
-- **Host.** A Linux Python host (gunicorn doesn't run on Windows). Install
-  `requirements.txt`, then start with:
+| Setting | Value |
+|---|---|
+| Root Directory | `backend` |
+| Runtime | Python 3 (pinned to 3.13 by [backend/.python-version](backend/.python-version)) |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120 --access-logfile -` |
+| Health Check Path | `/api/health/` |
 
-  ```bash
-  gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 60
-  ```
+- **Timeout.** A coast-to-coast plan can take about 70 s, because TomTom
+  computes long alternatives, so the worker timeout is 120 s. Threads let
+  other requests be served meanwhile.
+- **Environment variables** go in Render's dashboard, never in files. See
+  the table below.
+- **Hostname.** `RENDER_EXTERNAL_HOSTNAME` is set by Render and added to
+  `ALLOWED_HOSTS` automatically.
+- **No database, migrations or static files.** `DATABASES = {}`. The API
+  serves JSON only, with no admin, templates or browsable API, so WhiteNoise
+  and `collectstatic` aren't needed.
+- **Deploy check.** `manage.py check --deploy` with the production variables
+  below reports only W005 and W021 (HSTS includeSubDomains and preload).
+  These are deliberately off: you don't control the `onrender.com` parent
+  domain, and preload is a permanent commitment. W003 (CSRF) is silenced in
+  settings because the API is stateless, with no cookies, sessions or auth.
+- **Free plan behaviour.** The service sleeps after 15 minutes without
+  traffic, and the next request waits about a minute while it starts. Each
+  instance has its own in-memory forecast cache, which starts empty after
+  sleeping. Open-Meteo's free limits apply to the server's outbound IP; it
+  isn't documented whether Render free instances share outbound IPs, so watch
+  for HTTP 429 in the logs.
+- **Throttle client identity.** Render *appends* to `X-Forwarded-For`, so
+  its leftmost entry is client-controlled. `DJANGO_NUM_PROXIES=1` makes DRF
+  use the address Render's proxy added. Confirm it after deploying by
+  checking that requests from two networks aren't throttled together.
 
-  A plan request can take about 8 s, so keep the worker timeout well above
-  that.
-- **Environment.** Set `DJANGO_SECRET_KEY` (new and random),
-  `DJANGO_DEBUG=False`, `DJANGO_ALLOWED_HOSTS=<api host>`,
-  `CORS_ALLOWED_ORIGINS=https://<frontend host>` and `TOMTOM_API_KEY` in the
-  host's secret settings, not in files.
-- **No database or static files.** `DATABASES = {}`, and the API serves
-  JSON only, so no `collectstatic` step is needed.
-- **Settings that need attention.** `manage.py check --deploy` was run with
-  production-like values:
-  - **W004 / W008:** `SECURE_HSTS_SECONDS` and `SECURE_SSL_REDIRECT` aren't
-    set.
-  - **W003 (CSRF middleware):** intentional, because the API is stateless,
-    with no cookies, sessions or auth.
-
-  Behind a TLS-terminating proxy, you'll also need `SECURE_PROXY_SSL_HEADER`.
-  None of these are configured yet.
-- **Throttling behind a proxy.** `REST_FRAMEWORK["NUM_PROXIES"]` isn't set.
-  In that case DRF identifies a client by the **whole `X-Forwarded-For`
-  header** when one is present, and by `REMOTE_ADDR` otherwise. Clients can
-  set that header themselves, which lets them sidestep the per-client limits.
-  Set `NUM_PROXIES` to match the hosting proxy chain.
+| Render variable | Required | Example (not a real secret) |
+|---|---|---|
+| `DJANGO_SECRET_KEY` | Yes | a new 50-character random string (`get_random_secret_key()`) |
+| `DJANGO_DEBUG` | Yes | `False` |
+| `DJANGO_ALLOWED_HOSTS` | Yes | `weather-aware-truck-routing-api.onrender.com` |
+| `TOMTOM_API_KEY` | Yes | your TomTom key (secret) |
+| `CORS_ALLOWED_ORIGINS` | Yes, once the frontend exists | `https://weather-aware-truck-routing.vercel.app` |
+| `CORS_ALLOWED_ORIGIN_REGEXES` | Optional | `^https://weather-aware-truck-routing-[a-z0-9-]+\.vercel\.app$` |
+| `DJANGO_BEHIND_HTTPS_PROXY` | Recommended | `True` |
+| `DJANGO_SECURE_SSL_REDIRECT` | Recommended | `True` (only with `DJANGO_BEHIND_HTTPS_PROXY=True`) |
+| `DJANGO_SECURE_HSTS_SECONDS` | Recommended | `3600` (raise later) |
+| `DJANGO_NUM_PROXIES` | Recommended | `1` |
+| `PYTHON_VERSION` | Optional | `3.13.5`; overrides `.python-version` if Render doesn't pick the file up from the Root Directory |
 - **Caching.** `LocMemCache` is per process. With several gunicorn workers or
   instances, forecasts aren't shared. A shared cache such as Redis would
   reduce Open-Meteo calls.

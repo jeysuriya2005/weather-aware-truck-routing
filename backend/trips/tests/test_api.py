@@ -76,7 +76,8 @@ def test_geocode_validates_query(api, params):
 
 @responses.activate
 def test_plan_returns_routes(api):
-    responses.add(responses.GET, ROUTE_URL, json=fx.routes_payload(3))
+    # Echo the requested departAt (like the live API) so the test is date-independent.
+    responses.add_callback(responses.GET, ROUTE_URL, callback=fx.routes_callback(3))
     mock_open_meteo()
     response = api.post("/api/trips/plan/", plan_body(), format="json")
     assert response.status_code == 200
@@ -95,7 +96,8 @@ def test_plan_returns_routes(api):
     assert first["distance_meters"] == 1_419_953
     assert first["distance_miles"] == 882.3
     assert first["duration_seconds"] == 42_540
-    assert first["arrival_time"] == "2026-10-25T18:49:00-06:00"
+    departure = datetime.fromisoformat(first["departure_time"])
+    assert datetime.fromisoformat(first["arrival_time"]) - departure == timedelta(seconds=42_540)
     assert first["geometry"]["type"] == "LineString"
     # GeoJSON order is [lon, lat].
     assert first["geometry"]["coordinates"][0] == [-96.797, 32.7767]
